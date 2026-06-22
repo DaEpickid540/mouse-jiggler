@@ -1,21 +1,20 @@
 /*
- * Mouse Jiggler — Raw BLE HID Mouse
- * ESP32 WROOM / D0WD-V3
- * No external parts — onboard LED only (GPIO 2)
+ * Mouse Jiggler — Chaotic BLE HID Mouse
+ * ESP32 WROOM / D0WD-V3 — No external parts
  *
- * LED patterns:
- *   Slow blink (1s)  = advertising
- *   Solid on         = connected + jiggling
- *   Fast blink 200ms = paused/killed
+ * Fires a random pattern every ~30 seconds:
+ *   Circle   — 200px diameter, returns to center
+ *   Figure-8 — Lissajous curve, returns to center
+ *   Zigzag   — Sharp diagonal bursts, returns to center
+ *   Chaos    — Random fling, snaps back to center
+ *   Spiral   — Expands outward, snaps back to center
  *
- * Serial commands:
- *   kill   → toggle jiggler on/off
- *   status → print current state
- *   count  → show jiggle counter
- *   reset  → zero the counter
+ * LED (GPIO 2):
+ *   Slow blink  = advertising
+ *   Solid on    = connected + running
+ *   Fast blink  = paused/killed
  *
- * No libraries to install — all built into ESP32 core.
- * Board: ESP32 Dev Module
+ * Serial commands: kill | status | count | reset
  */
 
 #include <BLEDevice.h>
@@ -24,23 +23,20 @@
 #include <BLE2902.h>
 #include <BLEHIDDevice.h>
 #include <HIDTypes.h>
+#include <math.h>
 
-// ─── Built-in LED ─────────────────────────────────────────
-#define LED_PIN  2   // Onboard blue LED (most ESP32 dev boards)
+// ─── Config ───────────────────────────────────────────────
+#define LED_PIN   2
+#define INTERVAL  30000   // 30s between jiggles
+#define VARIANCE   5000   // ±5s randomness so it feels natural
 
-// ─── Jiggle config ────────────────────────────────────────
-#define JIGGLE_MIN 1000
-#define JIGGLE_MAX 4000
-#define JIGGLE_AMT 8
-
-// ─── HID Report Descriptor (standard 3-byte mouse) ────────
+// ─── HID Report Descriptor ────────────────────────────────
 static const uint8_t mouseReportDesc[] = {
   USAGE_PAGE(1),       0x01,
   USAGE(1),            0x02,
   COLLECTION(1),       0x01,
     USAGE(1),          0x01,
     COLLECTION(1),     0x00,
-
       USAGE_PAGE(1),    0x09,
       USAGE_MINIMUM(1), 0x01,
       USAGE_MAXIMUM(1), 0x03,
@@ -49,11 +45,9 @@ static const uint8_t mouseReportDesc[] = {
       REPORT_COUNT(1),  0x03,
       REPORT_SIZE(1),   0x01,
       HIDINPUT(1),      0x02,
-
       REPORT_COUNT(1),  0x01,
       REPORT_SIZE(1),   0x05,
       HIDINPUT(1),      0x03,
-
       USAGE_PAGE(1),    0x01,
       USAGE(1),         0x30,
       USAGE(1),         0x31,
@@ -62,7 +56,6 @@ static const uint8_t mouseReportDesc[] = {
       REPORT_SIZE(1),   0x08,
       REPORT_COUNT(1),  0x02,
       HIDINPUT(1),      0x06,
-
     END_COLLECTION(0),
   END_COLLECTION(0)
 };
@@ -70,12 +63,12 @@ static const uint8_t mouseReportDesc[] = {
 // ─── BLE objects ──────────────────────────────────────────
 BLEHIDDevice*      hid;
 BLECharacteristic* inputReport;
-bool               connected = false;
+bool               connected  = false;
 
 // ─── State ────────────────────────────────────────────────
 bool          killed      = false;
 int           jiggleCount = 0;
-unsigned long lastJiggle  = 0;
+unsigned long nextJiggle  = 30000;
 unsigned long lastLED     = 0;
 bool          ledState    = false;
 String        serialBuf   = "";
@@ -84,8 +77,8 @@ String        serialBuf   = "";
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
     connected = true;
-    digitalWrite(LED_PIN, HIGH);  // Solid on = connected
-    Serial.println("[BLE] Connected! Jiggling...");
+    digitalWrite(LED_PIN, HIGH);
+    Serial.println("[BLE] Connected! Jiggling every ~30s...");
   }
   void onDisconnect(BLEServer* s) override {
     connected = false;
@@ -96,8 +89,14 @@ class ServerCallbacks : public BLEServerCallbacks {
 
 // ─── Prototypes ───────────────────────────────────────────
 void setupBLE();
-void updateLED();
-void doJiggle();
+void sendMove(int8_t x, int8_t y);
+void returnToCenter(int32_t dx, int32_t dy);
+void doCircle();
+void doFigure8();
+void doZigzag();
+void doChaos();
+void doSpiral();
+void doPattern();
 void handleSerialCommand(String cmd);
 void printStatus();
 
@@ -110,14 +109,11 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  Serial.println("\n╔═══════════════════════════════════╗");
-  Serial.println("║   Mouse Jiggler — Raw BLE Mouse  ║");
-  Serial.println("║   kill | status | count | reset  ║");
-  Serial.println("║                                  ║");
-  Serial.println("║ LED: slow=advertising            ║");
-  Serial.println("║      solid=connected             ║");
-  Serial.println("║      fast=paused                 ║");
-  Serial.println("╚═══════════════════════════════════╝\n");
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println("║  Chaotic Mouse Jiggler — BLE Mouse  ║");
+  Serial.println("║  kill | status | count | reset      ║");
+  Serial.println("║  Fires every ~30s — Teams-proof     ║");
+  Serial.println("╚══════════════════════════════════════╝\n");
 
   setupBLE();
   randomSeed(analogRead(0));
@@ -127,7 +123,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // ─── Serial input ───────────────────────────────────────
+  // ─── Serial commands ──────────────────────────────────
   if (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
@@ -142,7 +138,7 @@ void loop() {
     }
   }
 
-  // ─── LED blink logic ────────────────────────────────────
+  // ─── LED blink logic ──────────────────────────────────
   if (!connected) {
     // Slow blink = advertising
     if (now - lastLED > 1000) {
@@ -162,12 +158,164 @@ void loop() {
     digitalWrite(LED_PIN, HIGH);
   }
 
-  // ─── Jiggle ─────────────────────────────────────────────
-  if (!killed && connected &&
-      now - lastJiggle > (unsigned long)random(JIGGLE_MIN, JIGGLE_MAX)) {
-    doJiggle();
-    lastJiggle = now;
+  // ─── Pattern trigger ──────────────────────────────────
+  if (!killed && connected && now >= nextJiggle) {
+    doPattern();
   }
+}
+
+// ═════════════════════════════════════════════════════════
+// Core mouse send — 8ms gap between HID reports
+// ═════════════════════════════════════════════════════════
+
+void sendMove(int8_t x, int8_t y) {
+  if (!connected) return;
+  uint8_t report[3] = { 0x00, (uint8_t)x, (uint8_t)y };
+  inputReport->setValue(report, sizeof(report));
+  inputReport->notify();
+  delay(8);
+}
+
+// Sends mouse back to where it started — handles >127px
+// by breaking into multiple packets of 100px max
+void returnToCenter(int32_t dx, int32_t dy) {
+  dx = -dx;
+  dy = -dy;
+  while (abs(dx) > 0 || abs(dy) > 0) {
+    int8_t sx = (int8_t)constrain(dx, -100, 100);
+    int8_t sy = (int8_t)constrain(dy, -100, 100);
+    sendMove(sx, sy);
+    dx -= sx;
+    dy -= sy;
+    delay(10);
+  }
+}
+
+// ═════════════════════════════════════════════════════════
+// Patterns — all return to center after moving
+// ═════════════════════════════════════════════════════════
+
+// Full circle, ~200px diameter
+void doCircle() {
+  Serial.println("[PAT] Circle");
+  const float radius = 100.0;
+  const int   steps  = 40;
+  int32_t accumX = 0, accumY = 0;
+  float prevX = radius, prevY = 0;
+
+  for (int i = 1; i <= steps; i++) {
+    float angle = (2.0 * PI * i) / steps;
+    float currX = radius * cos(angle);
+    float currY = radius * sin(angle);
+    int8_t dx = (int8_t)constrain((int)(currX - prevX), -127, 127);
+    int8_t dy = (int8_t)constrain((int)(currY - prevY), -127, 127);
+    accumX += dx; accumY += dy;
+    sendMove(dx, dy);
+    delay(20);
+    prevX = currX; prevY = currY;
+  }
+  returnToCenter(accumX, accumY);
+}
+
+// Lissajous figure-8, ~200px wide
+void doFigure8() {
+  Serial.println("[PAT] Figure-8");
+  const float A = 100.0;
+  const float B = 50.0;
+  const int   steps = 48;
+  int32_t accumX = 0, accumY = 0;
+  float prevX = 0, prevY = 0;
+
+  for (int i = 1; i <= steps; i++) {
+    float t     = (2.0 * PI * i) / steps;
+    float currX = A * sin(t);
+    float currY = B * sin(2 * t);
+    int8_t dx = (int8_t)constrain((int)(currX - prevX), -127, 127);
+    int8_t dy = (int8_t)constrain((int)(currY - prevY), -127, 127);
+    accumX += dx; accumY += dy;
+    sendMove(dx, dy);
+    delay(18);
+    prevX = currX; prevY = currY;
+  }
+  returnToCenter(accumX, accumY);
+}
+
+// Sharp diagonal zigzags
+void doZigzag() {
+  Serial.println("[PAT] Zigzag");
+  const int legs    = random(4, 9);
+  const int legSize = 35;
+  int32_t accumX = 0, accumY = 0;
+
+  for (int i = 0; i < legs; i++) {
+    int dir = (i % 2 == 0) ? 1 : -1;
+    for (int s = 0; s < 6; s++) {
+      int8_t sx = (int8_t)(dir * legSize / 6);
+      int8_t sy = (int8_t)(dir * legSize / 6);
+      sendMove(sx, sy);
+      accumX += sx; accumY += sy;
+      delay(18);
+    }
+  }
+  returnToCenter(accumX, accumY);
+}
+
+// Random fling bursts — most chaotic
+void doChaos() {
+  Serial.println("[PAT] Chaos");
+  const int bursts  = random(6, 13);
+  int32_t accumX = 0, accumY = 0;
+
+  for (int i = 0; i < bursts; i++) {
+    int8_t dx = (int8_t)random(-90, 91);
+    int8_t dy = (int8_t)random(-90, 91);
+    if (abs(dx) < 20 && abs(dy) < 20) dx = 60; // avoid tiny moves
+    sendMove(dx, dy);
+    accumX += dx; accumY += dy;
+    delay(random(25, 90)); // irregular timing = chaotic
+  }
+  delay(150);
+  returnToCenter(accumX, accumY);
+}
+
+// Expanding spiral then snaps back
+void doSpiral() {
+  Serial.println("[PAT] Spiral");
+  const int steps = 36;
+  int32_t accumX = 0, accumY = 0;
+  float prevX = 0, prevY = 0;
+
+  for (int i = 0; i < steps; i++) {
+    float t      = (2.0 * PI * i) / steps;
+    float radius = 3.0 * i;         // Grows 0 → ~108px
+    float currX  = radius * cos(t);
+    float currY  = radius * sin(t);
+    int8_t dx = (int8_t)constrain((int)(currX - prevX), -127, 127);
+    int8_t dy = (int8_t)constrain((int)(currY - prevY), -127, 127);
+    accumX += dx; accumY += dy;
+    sendMove(dx, dy);
+    delay(20);
+    prevX = currX; prevY = currY;
+  }
+  returnToCenter(accumX, accumY);
+}
+
+// Picks a random pattern, schedules next one
+void doPattern() {
+  switch (random(5)) {
+    case 0: doCircle();  break;
+    case 1: doFigure8(); break;
+    case 2: doZigzag();  break;
+    case 3: doChaos();   break;
+    case 4: doSpiral();  break;
+  }
+  jiggleCount++;
+  nextJiggle = millis() + INTERVAL + random(-(long)VARIANCE, (long)VARIANCE);
+  Serial.print("[JIGGLE] Done. Total patterns: ");
+  Serial.print(jiggleCount);
+  Serial.print("  Next in ~");
+  Serial.print((nextJiggle - millis()) / 1000);
+  Serial.println("s");
 }
 
 // ═════════════════════════════════════════════════════════
@@ -191,23 +339,12 @@ void setupBLE() {
   hid->startServices();
 
   BLEAdvertising* adv = server->getAdvertising();
-  adv->setAppearance(0x03C2);  // HID Mouse
+  adv->setAppearance(0x03C2);
   adv->addServiceUUID(hid->hidService()->getUUID());
   adv->setScanResponse(false);
   adv->start();
 
   Serial.println("[BLE] Advertising as 'MouseJiggler'...");
-}
-
-void doJiggle() {
-  int8_t x = random(-JIGGLE_AMT, JIGGLE_AMT + 1);
-  int8_t y = random(-JIGGLE_AMT, JIGGLE_AMT + 1);
-  if (x == 0 && y == 0) x = 3;
-
-  uint8_t report[3] = { 0x00, (uint8_t)x, (uint8_t)y };
-  inputReport->setValue(report, sizeof(report));
-  inputReport->notify();
-  jiggleCount++;
 }
 
 void handleSerialCommand(String cmd) {
@@ -230,18 +367,22 @@ void handleSerialCommand(String cmd) {
 }
 
 void printStatus() {
-  Serial.println("\n╔═══════════════════════════════════╗");
-  Serial.print("║ BLE:   ");
-  Serial.print(connected ? "Connected        " : "Advertising...   ");
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.print("║ BLE:     ");
+  Serial.print(connected ? "Connected          " : "Advertising...     ");
   Serial.println("║");
-  Serial.print("║ State: ");
-  Serial.print(killed ? "PAUSED       " : "RUNNING      ");
+  Serial.print("║ State:   ");
+  Serial.print(killed ? "PAUSED         " : "RUNNING        ");
   Serial.println("║");
-  Serial.print("║ Count: ");
+  Serial.print("║ Patterns: ");
   Serial.print(jiggleCount);
-  if      (jiggleCount < 10)  Serial.print("        ");
-  else if (jiggleCount < 100) Serial.print("       ");
-  else                        Serial.print("      ");
-  Serial.println("║");
-  Serial.println("╚═══════════════════════════════════╝\n");
+  Serial.println("                    ║");
+  if (connected && !killed) {
+    Serial.print("║ Next in: ~");
+    long secs = ((long)nextJiggle - (long)millis()) / 1000;
+    if (secs < 0) secs = 0;
+    Serial.print(secs);
+    Serial.println("s                   ║");
+  }
+  Serial.println("╚══════════════════════════════════════╝\n");
 }
